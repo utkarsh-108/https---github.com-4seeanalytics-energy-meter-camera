@@ -1,131 +1,200 @@
 #include "WiFi.h"
-#include "esp_camera.h"
-#include "Arduino.h"
-#include "soc/soc.h"           // Disable brownout problems
-#include "soc/rtc_cntl_reg.h"  // Disable brownout problems
-#include "driver/rtc_io.h"
-#include <SPIFFS.h>
-#include <FS.h>
-#include <Firebase_ESP_Client.h>
-//Provide the token generation process info.
-#include <addons/TokenHelper.h>
-// Timestamp
-#include "time.h"
+#include <PubSubClient.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <WebServer.h>
+// #include <WiFiClient.h>
+#include <WiFiClientSecure.h>
+#include <ESPmDNS.h>
+// #include <WiFi.h>
+#include <TaskScheduler.h>
+#include "camera.h"
+#include "types.h"
+#include "mqtt.h"
+#include "fx.h"
+// #include "networking.h"
 
-const char* ntpServer = "pool.ntp.org";
-struct tm timeinfo;
+// #include "config.h"
+bool shouldreboot = false;
 
-//Replace with your network credentials
-const char* ssid = "Veea_test";
-const char* password = "veea_test";
+/******************* Setup Code ********************/
+#include "Wifi_BLE_config.h"
+#include "timer.h"
+#include "config.h"
+/**********************************/
 
-// Insert Firebase project API Key
-//#define API_KEY "AIzaSyBf57JZPv8kG0IffUj6OMvOg6LVaJSedXw"
+void task_send_mqtt_hearbeatCallback();
+void task_check_connectivityCallback();
+void task_scheduled_rebootCallback();
+/******************* Setup Code **********************/
 
-#define API_KEY "AIzaSyC9VLuawf8jxQ3kXafG5jG1OdEtXnywyfo"
-  
+String bid = WiFi.macAddress();
 
-// Insert Authorized Email and Corresponding Password
-#define USER_EMAIL "energy_meter_cam@annet.com"
-#define USER_PASSWORD "energy@123"
+volatile bool connected_to_web = false;
+volatile bool credentails_recieved = false;
+volatile int wifi_connected = Non;
+volatile int deviceConnected = Non;
 
-
-// Insert Firebase storage bucket ID e.g bucket-name.appspot.com
-#define STORAGE_BUCKET_ID "stg-sec-live.appspot.com"
-
-// Photo File Name to save in SPIFFS
-//#define FILE_PHOTO  "/data/photo.jpg"
-String FILE_PHOTO ;
+volatile extern uint8_t isUpdaetAvailable;
 
 
-// OV2640 camera module pins (CAMERA_MODEL_AI_THINKER)
-#define PWDN_GPIO_NUM     32
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0
-#define SIOD_GPIO_NUM     26
-#define SIOC_GPIO_NUM     27
-#define Y9_GPIO_NUM       35
-#define Y8_GPIO_NUM       34
-#define Y7_GPIO_NUM       39
-#define Y6_GPIO_NUM       36
-#define Y5_GPIO_NUM       21
-#define Y4_GPIO_NUM       19
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM        5
-#define VSYNC_GPIO_NUM    25
-#define HREF_GPIO_NUM     23
-#define PCLK_GPIO_NUM     22
+// Define a task handle and initialize it to NULL
+TaskHandle_t task_handle = NULL;
+TaskHandle_t task2_handle = NULL;
+#define SCHEDULED_REBOOT_TIMER 1 * 25 * 60 * 60 * 1000 // Hours
+#define SCHEDULED_CONNECTIVITY_TIMER 5 * 60 * 1000     // Minutes
+#define SCHEDULED_HEARBEAT_TIMER 1 * 10 * 1000         // Seconds
 
-#define LED_BUILTIN 4
+Task task_send_mqtt_hearbeat(SCHEDULED_HEARBEAT_TIMER, TASK_FOREVER, &task_send_mqtt_hearbeatCallback);
+Task task_check_connectivity(SCHEDULED_CONNECTIVITY_TIMER, TASK_FOREVER, &task_check_connectivityCallback);
+Task task_scheduled_reboot(SCHEDULED_REBOOT_TIMER, TASK_FOREVER, &task_scheduled_rebootCallback);
 
-boolean takeNewPhoto = true;
+Scheduler runner;
 
-//Define Firebase Data objects
-FirebaseData fbdo;
-FirebaseAuth auth;
-FirebaseConfig configF;
 
-bool taskCompleted = false;
 
-// Check if photo capture was successful
-bool checkPhoto( fs::FS &fs ) 
+// Scheduler ts;
+
+extern data_config WM_config;
+
+uint8_t Setup_Mode = 0;
+
+/******************* Setup Code **********************/
+
+void EEPROM_Setup(void)
 {
-  File f_pic = fs.open( FILE_PHOTO );
-  unsigned int pic_sz = f_pic.size();
-  return ( pic_sz > 100 );
-}
-
-// Capture Photo and Save it to SPIFFS
-void capturePhotoSaveSpiffs( void ) 
-{  
-  camera_fb_t * fb = NULL; // pointer
-  bool ok = 0; // Boolean indicating if the picture has been taken correctly
-  do {
-      // Take a photo with the camera
-      Serial.println("Taking a photo...");
-      Serial.println("");
-      fb = esp_camera_fb_get();
-      if (!fb) 
-      {
-        Serial.println("Camera capture failed");
-        return;
-      }
-      // Photo file name
-      Serial.print("Picture file name");
-      Serial.println(FILE_PHOTO); 
-
-      File file = SPIFFS.open(FILE_PHOTO, FILE_WRITE);
-      //File file = SPIFFS.open(PATH, FILE_WRITE);
-      // Insert the data in the photo file
-      if (!file)
-      {
-        Serial.println("Failed to open file in writing mode");
-      }
-      else
-      {
-        file.write(fb->buf, fb->len); // payload (image), payload length
-        Serial.print("The picture has been saved in ");
-        Serial.print(FILE_PHOTO);
-        Serial.print(" - Size: ");
-        Serial.print(file.size());
-        Serial.println(" bytes");
-      }
-      // Close the file
-      file.close();
-      esp_camera_fb_return(fb);
-
-      // check if file has been correctly saved in SPIFFS
-      ok = checkPhoto(SPIFFS);
-  } while ( !ok );
-}
-
-void initWiFi()
-{
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) 
+  if (!EEPROM.begin(EEPROM_SIZE))
   {
     delay(1000);
-    Serial.println("Connecting to WiFi...");
+  }
+  erase_eeprom();
+}
+
+
+/*************************************************************************
+ * void general_process(void)
+ * carries out the basic process for obtaining WiFi credentials using BLE.
+ * Author : Utkarsh Chitte
+ * Last Modified : 22-04-11
+ ************************************************************************/
+void general_process(void)
+{
+  if (deviceConnected == Ok && wifi_connected != Ok) // for some reasons ble is connected whe wifi is connected
+  {
+    // led_colour = BLUE_FAST;
+    Serial.println("Device connected via bluetooth");
+    deviceConnected = Non;
+  }
+  else if (deviceConnected == Fail)
+  {
+    // led_colour = RED_FAIL;
+    Serial.println("Bluetooth connection failed!!!");
+    deviceConnected = Non;
+  }
+  else if (credentails_recieved == true)
+  {
+    // led_colour = WHITE_FAST;
+    Serial.println("Credentails Recieved...");
+    credentails_recieved = false;
+    wifiConnectTask();
+  }
+  else if (wifi_connected == Ok)
+  {
+    delay(3000);
+    // led_colour = RED_CONST;
+    // Serial.println("WiFi Connected!!!");
+    Serial.println("Performing OTA Update!!!");
+    wifi_connected = Non;
+    OTA_Update();
+  }
+  else if (wifi_connected == Fail)
+  {
+    // led_colour = RED_FAIL;
+    Serial.println("WiFi connection failed!!!");
+    wifi_connected = Non;
+  }
+  else if (isUpdaetAvailable == false)
+  {
+    // led_colour = RED_FAIL;
+    Serial.println("Update failed!!!");
+    isUpdaetAvailable = Non;
+  }
+}
+
+void Failure_action(void)
+{
+  // vTaskDelete(task_handle); // delete the task when any interrupt occurs in loop.
+  erase_eeprom();
+  Serial.println("---failed---");
+}
+/*******************************************************
+ * setup_hardawre()
+ * Setup the hardware, buttons, Device, Display, etc.
+ * Author : Kaushlesh Chandel
+ * Last Modified : Build 21/07/06
+ ******************************************************/
+void setup_hardawre()
+{
+  String myDeviceCode = WM_config.device_config.device_code; 
+  device_mac = WiFi.macAddress();
+  device_mac.replace(":", "");
+}
+
+/******************************************************************
+ * void Device_Connection(void)
+ * checks the connection status and if connected performs the task.
+ * Author : Sagar Kota
+ * Last Modified : 22-03-09
+ ******************************************************************/
+void Device_Connection(void)
+{  
+    deviceConnected = Non;
+    
+}
+
+/***************************************************************************
+ * void Credentails_Recieved(void)
+ * checks the credentails recieved status and if recieved performs the task.
+ * Author : Sagar Kota
+ * Last Modified : 22-03-09
+ ***************************************************************************/
+void Credentails_Recieved(void)
+{
+  if (credentails_recieved)
+  {
+     credentails_recieved = false;
+  }
+}
+
+/**********************************************************************
+ * void Wifi_Connection(void)
+ * checks the wifi connection status and if connected performs the task.
+ * Author : Sagar Kota
+ * Last Modified : 22-03-09
+ *********************************************************************/
+void Wifi_Connection(void)
+{
+  if (wifi_connected == Ok)
+  {
+    Serial.println("wifi");
+    wifi_connected = Non;
+  }
+}
+
+/*********************************************************************
+ * void Connection_Failure(void)
+ * checks if any connection failed and based on that performs the task.
+ * Author : Sagar Kota
+ * Last Modified : 22-03-09
+ *********************************************************************/
+void Connection_Failure(void)
+{
+  if (wifi_connected == Fail || deviceConnected == Fail || isUpdaetAvailable == Fail)
+  {
+    Failure_action();
+    wifi_connected = Non;
+    deviceConnected = Non;
   }
 }
 
@@ -143,205 +212,196 @@ void initSPIFFS()
   }
 }
 
-void initCamera()
+void initWiFi()
 {
- // OV2640 camera module
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-
-  if (psramFound()) 
-  {
-    config.frame_size = FRAMESIZE_UXGA;
-    config.jpeg_quality = 10;
-    config.fb_count = 2;
-  } 
-  else 
-  {
-    config.frame_size = FRAMESIZE_SVGA;
-    config.jpeg_quality = 12;
-    config.fb_count = 1;
-  }
-  // Camera init
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK)
-  {
-    Serial.printf("Camera init failed with error 0x%x", err);
-    ESP.restart();
-  } 
-
-  //Setting for the Image
-  sensor_t * s = esp_camera_sensor_get();
-  s->set_brightness(s,0);     // -2 to 2
-  s->set_contrast(s,0);       // -2 to 2
-  s->set_saturation(s,0);     // -2 to 2
-  s->set_special_effect(s, 0); // 0 to 6 (0 - No Effect, 1 - Negative, 2 - Grayscale, 3 - Red Tint, 4 - Green Tint, 5 - Blue Tint, 6 - Sepia)
-  s->set_whitebal(s, 0);       // 0 = disable , 1 = enable
-  s->set_awb_gain(s, 1);       // 0 = disable , 1 = enable
-  s->set_wb_mode(s, 1);        // 0 to 4 - if awb_gain enabled (0 - Auto, 1 - Sunny, 2 - Cloudy, 3 - Office, 4 - Home)
-  s->set_exposure_ctrl(s, 1);  // 0 = disable , 1 = enable
-  s->set_aec2(s, 1);           // 0 = disable , 1 = enable
-  s->set_ae_level(s, 0);       // -2 to 2
-  s->set_aec_value(s, 300);    // 0 to 1200
-  s->set_gain_ctrl(s, 0);      // 0 = disable , 1 = enable
-  s->set_agc_gain(s, 0);       // 0 to 30
-  s->set_gainceiling(s, (gainceiling_t)3);  // 0 to 6
-  s->set_bpc(s, 0);            // 0 = disable , 1 = enable
-  s->set_wpc(s, 1);            // 0 = disable , 1 = enable
-  s->set_raw_gma(s, 1);        // 0 = disable , 1 = enable
-  s->set_lenc(s, 1);           // 0 = disable , 1 = enable
-  s->set_hmirror(s, 0);        // 0 = disable , 1 = enable
-  s->set_vflip(s, 0);          // 0 = disable , 1 = enable
-  s->set_dcw(s, 1);            // 0 = disable , 1 = enable
-  s->set_colorbar(s, 0);       // 0 = disable , 1 = enable
-
-}
-
-unsigned long get_Time()
-{
-  time_t now;
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo))
-  {
-    //Serial.println("Failed to obtain time");
-    return(0);
-  }
-  time(&now);
-  return now;
-}
-
-String make_path()
-{ 
-  unsigned long gettime = get_Time();
-  String ID = WiFi.macAddress();
-  ID.replace(":", "");
-  String path;
-  path += "/";
-  path += ID;
-  path += "/";
-  //path += ID;
-  //path += "_";
-  path += gettime;
-  path += ".jpg";
-  Serial.println(path);
-
-  return path;
-}
-
-void wait()
-{
-  for(int i = 1; i<= 60 ; i++) //put mutliples of 60 to increase duration of intervals
+  WiFi.disconnect(true);
+  delay(1000);
+  WiFi.begin(DEFAULT_SSID, DEFAULT_WIFI_PWD);
+  
+  while (WiFi.status() != WL_CONNECTED) 
   {
     delay(1000);
-    if((i%10) == 0)
-    {
-      Serial.print(".");
-    }
+    Serial.println("Connecting to WiFi...");
   }
-  Serial.println("");
+  OTA_Update();
 }
 
 void setup() 
 {  
   Serial.begin(115200);
-  pinMode (LED_BUILTIN, OUTPUT);
-  initWiFi();
-  Serial.print("Connected to WiFi: ");
-  Serial.println(ssid);
-  Serial.println("----------------------------------------------------------------");
-  initSPIFFS();
-  // Turn-off the 'brownout detector'
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-  initCamera();
-  
-  configTime(0, 0, ntpServer);
-  get_Time();
-  
-  delay(1000);
-
-  //Firebase
-  // Assign the api key
-  configF.api_key = API_KEY;
-  //Assign the user sign in credentials
-  auth.user.email = USER_EMAIL;
-  auth.user.password = USER_PASSWORD;
-  //Assign the callback function for the long running token generation task
-  configF.token_status_callback = tokenStatusCallback; //see addons/TokenHelper.h
-
-  Firebase.begin(&configF, &auth);
-  Firebase.reconnectWiFi(true);
-  
-  //Clicking Pictures initially helps with setting proper image quality
-  for(int i=0 ; i<= 4; i++)
+  check_configurations();
+  if (deviceHasConfig == true)
   {
-    digitalWrite(LED_BUILTIN,HIGH);
-    delay(200);
-    digitalWrite(LED_BUILTIN,LOW);
-    FILE_PHOTO = make_path();
-    capturePhotoSaveSpiffs();
-    delay(500);
-    SPIFFS.remove(FILE_PHOTO);
+    Setup_Mode = 0;
   }
-  delay(1000);
-  
+  else
+  {
+    // Setup_Mode = 1;
+    Setup_Mode = 0;
+  }
+  switch (Setup_Mode)
+  {
+    case 0: //Normal  mode setup .....Initialize the camera
+            pinMode (Flash, OUTPUT);
+            initSPIFFS();
+            initWiFi();
+            setup_hardawre();
+            serial_print_config(); // Print Config to Serial port
+
+            // debug_string(String(ESP.getFreeHeap()));         
+            
+            // Serial.print("Connected to WiFi: ");
+            // Serial.println(DEFAULT_SSID);
+            
+            Serial.println("----------------------------------------------------------------");
+            
+            // WiFi.onEvent(WiFiEvent);// Bind the wifi event for debug
+
+            WiFi.onEvent(WiFiGotIP, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP); // Fire the event when degvice gets IP Address
+
+            if (deviceHasConfig == false || hasWiFi1Credentials == false)
+            {
+              debug_string("New device. Connecting to setup wifi");
+              wifiOnline = wm_fast(true);
+            }
+            else if (portalOnDemand)
+            {
+              debug_string("Portal on demand");
+              wm_setup(true);
+            }
+            else
+            {
+              debug_string("Has saved wifi. Fast Wifi Connect");
+              wifiOnline = wm_fast(false);
+            }
+
+            if (wifiOnline)
+            {
+              Serial.println("checking for update");
+              if (checkUpdateFirmware(SW_VERSION, HW_VERSION) == false)
+              {
+                Serial.println("checking for update");
+                debug_string("No OTA updates");
+              }
+
+              debug_string("Initialize MQTT ");
+              if (init_mqtt() == true)
+              {
+                debug_string("MQTT Connected");
+              }
+
+              debug_string("IP Address : " + WiFi.localIP().toString());
+              debug_string("Device mac : " + device_mac);
+            }       
+
+            // Runner has list of tasks that must be run at a set period
+            runner.init();
+
+            // Add task to Runner.
+            runner.addTask(task_send_mqtt_hearbeat);
+            runner.addTask(task_check_connectivity);
+            runner.addTask(task_scheduled_reboot);
+
+            // Enable the tasks. tasks start after 10 seconds
+            task_send_mqtt_hearbeat.enableDelayed(10000);
+            task_check_connectivity.enableDelayed(10000);
+            task_scheduled_reboot.enableDelayed(10000);
+            
+            if (wifiOnline)
+              debug_string("All Good! Proceed to runway with WiFi");
+            else
+              debug_string("ERROR! Proceed to runway without WiFI");
+
+
+     
+            // Turn-off the 'brownout detector'
+            WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+            initCamera();            
+            configTime(0, 0, ntpServer);
+            get_Time();            
+            delay(1000);
+            //Firebase
+            // Assign the api key
+            configF.api_key = API_KEY;
+            //Assign the user sign in credentials
+            auth.user.email = USER_EMAIL;
+            auth.user.password = USER_PASSWORD;
+            //Assign the callback function for the long running token generation task
+            configF.token_status_callback = tokenStatusCallback; //see addons/TokenHelper.h
+            Firebase.begin(&configF, &auth);
+            Firebase.reconnectWiFi(true);            
+            //Clicking Pictures initially helps with setting proper image quality
+            for(int i=0 ; i<= 4; i++)
+            {
+              digitalWrite(Flash,HIGH);
+              delay(200);
+              digitalWrite(Flash,LOW);
+              FILE_PHOTO = make_path();
+              capturePhotoSaveSpiffs();
+              delay(500);
+              SPIFFS.remove(FILE_PHOTO);
+            }
+            delay(1000);
+            break;
+    case 1: //setup mode ...........take and store Wifi Credentials
+            EEPROM_Setup();
+            Serial.print("Device MAC Address : ");
+            bid.replace(":", "");
+            Serial.println(bid); // mac address
+            WiFi_Setup_Using_BLE();
+            break;
+  }
   Serial.println("Setup complete !!!");
 }
 
 void loop()
  {
-  if (takeNewPhoto) 
+  switch (Setup_Mode)
   {
-    FILE_PHOTO = make_path();
-    Serial.print(FILE_PHOTO);
-    digitalWrite(LED_BUILTIN,HIGH);
-    capturePhotoSaveSpiffs();
-    delay(500);
-    digitalWrite(LED_BUILTIN,LOW);
-    takeNewPhoto = false;
-  }
-  delay(1000);
-  
-  if (Firebase.ready() && !taskCompleted)
-  {
-    taskCompleted = true;
-    Serial.print("Uploading picture... ");
+    case 0:   //normal mode click pictures and send to firebase and handles mqtt and command processes
+              loopsPM++;
+              process_cli();     // Process Serial port based commands recevied
+              runner.execute();  // Timer execution. Runs timed events like connectivity check, scheduled reboot. etc.
+              mqttclient.loop(); // Process messges received by MQTT subscription
 
-    //MIME type should be valid to avoid the download problem.
-    //The file systems for flash and SD/SDMMC can be changed in FirebaseFS.h.
-    if (Firebase.Storage.upload(&fbdo, STORAGE_BUCKET_ID /* Firebase Storage bucket id */, FILE_PHOTO /* path to local file */, mem_storage_type_flash /* memory storage type, mem_storage_type_flash and mem_storage_type_sd */, FILE_PHOTO /* path of remote file stored in the bucket */, "image/jpeg" /* mime type */))
-    {
-      Serial.printf("\nDownload URL: %s\n", fbdo.downloadURL().c_str());
-    }
-    else
-    {
-      Serial.println(fbdo.errorReason());
-      SPIFFS.remove(FILE_PHOTO);
-      ESP.restart();
-    }
-    
-    wait();
-    SPIFFS.remove(FILE_PHOTO);
-    Serial.println("Old file erased Camera ready to click new Picture.");
-    takeNewPhoto = true;
-    taskCompleted = false;
+              if (takeNewPhoto) 
+              {
+                FILE_PHOTO = make_path();
+                Serial.print(FILE_PHOTO);
+                digitalWrite(Flash,HIGH);
+                capturePhotoSaveSpiffs();
+                delay(500);
+                digitalWrite(Flash,LOW);
+                takeNewPhoto = false;
+              }
+              delay(1000);
+              
+              if (Firebase.ready() && !taskCompleted)
+              {
+                taskCompleted = true;
+                Serial.print("Uploading picture... ");
+
+                //MIME type should be valid to avoid the download problem.
+                //The file systems for flash and SD/SDMMC can be changed in FirebaseFS.h.
+                if (Firebase.Storage.upload(&fbdo, STORAGE_BUCKET_ID /* Firebase Storage bucket id */, FILE_PHOTO /* path to local file */, mem_storage_type_flash /* memory storage type, mem_storage_type_flash and mem_storage_type_sd */, FILE_PHOTO /* path of remote file stored in the bucket */, "image/jpeg" /* mime type */))
+                {
+                  Serial.printf("\nDownload URL: %s\n", fbdo.downloadURL().c_str());
+                }
+                else
+                {
+                  Serial.println(fbdo.errorReason());
+                  SPIFFS.remove(FILE_PHOTO);
+                  ESP.restart();
+                }
+                
+                wait();
+                SPIFFS.remove(FILE_PHOTO);
+                Serial.println("Old file erased Camera ready to click new Picture.");
+                takeNewPhoto = true;
+                taskCompleted = false;
+              }
+              break;
+    case 1:   void general_process();
+              break;
   }
-  
 }
